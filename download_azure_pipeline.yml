@@ -1,0 +1,275 @@
+trigger: none
+
+pool:
+  name: 'DXO Integration Agent Pool'  # Choose the appropriate VM image based on your requirements
+
+variables:
+- template : files_to_download.yml
+
+steps:
+  - task: AzureKeyVault@2
+    inputs:
+      azureSubscription: ${{ variables.azureSubscription }} # Service connection for the Azure subscription containing the Azure Key Vault instance
+      KeyVaultName: '' # Name of the Azure Key Vault instance
+      SecretsFilter: 'SMTP-USERNAME, SMTP-PASSWORD' # The secrets that need to be downloaded. '*' indicates all secrets
+      RunAsPreJob: false # Runs the task before the job execution begins. Exposes secrets to all tasks in the job, not just tasks that follow this one.
+  
+  - task: AzureCLI@2
+    inputs:
+      azureSubscription: ${{ variables.azureSubscription }}
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        # Function to check if a blob with name nexus_downloads.csv exists in Azure Storage
+        blob_exists() {
+            az storage blob show --container-name ${{ variables.container }} --name nexus_downloads.csv --account-name ${{ variables.storage_account }} &> /dev/null
+            return $?
+        }
+
+        # Function to download nexus_downloads.csv from Azure Storage if the blob exists
+        download_file_if_available() {
+            if blob_exists; then
+                az storage blob download --container-name ${{ variables.container }} --account-name ${{ variables.storage_account }} --name nexus_downloads.csv --file $(Build.ArtifactStagingDirectory)/nexus_downloads.csv
+                echo "File downloaded successfully."
+            else
+                echo "Blob does not exist. Creating a Blank file"
+                >$(Build.ArtifactStagingDirectory)/nexus_downloads.csv
+                echo "Date,Template_Folder,Template,Downloaded_by" >$(Build.ArtifactStagingDirectory)/nexus_downloads.csv
+            fi
+        }
+
+        download_file_if_available
+
+  - script: |
+      #!/bin/bash
+          
+      set -e
+      
+      ######################################################################## If reset variable is 1 then reset the nexus_downloads.csv
+      if [ ${{ variables.reset }} -eq 1 ]; then
+        echo "Resetting the nexus_downloads.csv file"
+        >nexus_downloads.csv
+        echo "Date,Template_Folder,Template,Downloaded_By" >nexus_downloads.csv
+      else
+        echo "Reset is false. Continuing with the script."
+        continue;
+      fi
+
+      #########################################################################
+
+      ########### Temporary filename to store downloaded chunks  ##########
+      output_file="temp.txt"
+      >temp.txt
+      >temp
+      continuationToken="null"
+
+      ########### Loop until there is no more continuation token (assuming 'continuationToken' field in response)
+      while true; do
+        if [[ "$continuationToken" == "null" ]]; then
+                url="${{ variables.base_url }}"
+        else
+                url="${{ variables.base_url }}&continuationToken=$continuationToken"
+        fi
+        response=$(curl -s "$url") 2> error.log
+        if [[ -s error.log ]]; then
+          echo "Error: Curl command failed. Check error.log for details."
+          exit 1
+        fi
+        echo $url
+        echo "$response" >> $output_file
+        continuationToken=$(echo $response | jq -r '.continuationToken')
+        echo $continuationToken
+        if [[ "$continuationToken" == "null" ]]; then
+                echo "continuationToken is null - We have reached the last page of nexus html view"
+                break
+        fi
+      done
+      grep "downloadUrl" $output_file > temp
+      ########################################################################
+      
+      ############ Extracting the url for each nexus asset from the downloaded html page ###########
+      while IFS= read -r line; do
+        url=$(echo $line | grep -o '"https[^"]*' | sed 's/"$//' | sed 's/^"//') 
+        #echo $url # Run your desired command here
+        url_array+=("$url")
+      done < temp
+
+      ######################################################################## Create the directory structure and download the templates into from_nexus folder
+      mkdir -p from_nexus
+      for file in ${{ variables.files_to_download }}
+      do
+        echo "A$file/"
+        for url in "${url_array[@]}"
+        do
+          echo "A$url/"
+          if [[ "$url" == *"$file" ]]; then
+            if [[ "$file" == *"/"* ]]; then
+              dir_path=$(dirname "$file")
+              # Create the directory structure if it doesn't exist
+              mkdir -p "from_nexus/$dir_path"
+              echo "$(Build.ArtifactStagingDirectory)/from_nexus/$file"
+              curl -o "from_nexus/$file" -p $url
+            else
+              curl -o "from_nexus/$(basename $url)" $url
+            fi
+          fi
+        done
+      done
+    displayName: 'Download from Nexus'
+    workingDirectory: $(Build.ArtifactStagingDirectory)
+
+  - script: |
+        #!/bin/bash
+
+        #git config --global user.email "shrayesh.sreenivasan@gmail.com"
+        #git config --global user.name "Shrayesh Sreenivasan"
+        cd $(Build.SourcesDirectory)
+        git clone ${{ variables.destinationRepo }}
+        Repo=$(echo ${{ variables.destinationRepo }} | sed 's/.*_git\///;s/ *$//')
+        if [ ! -d "$Repo/from_nexus" ] ; then mkdir -p "$Repo/from_nexus"; fi
+        cp -r $(Build.ArtifactStagingDirectory)/from_nexus/* $Repo/from_nexus/
+        cd $Repo/from_nexus
+        find . -type f > $(Build.SourcesDirectory)/file_list.txt
+        for filename in $(cat $(Build.SourcesDirectory)/file_list.txt); do
+            if [[ $filename == *.zip ]]; then
+              echo $filename
+              name=$(basename "$filename" .zip); mkdir "$name"; unzip -o "$filename" -d "$name"
+            fi
+        done 
+        cd $(Build.SourcesDirectory)/$Repo
+        git add .
+        git commit -m "Copy from devsecops_kit Nexus Repo"
+        git push -u origin main
+    displayName: 'Unzip and upload to destination Git'
+  
+  - script: |
+      #!/bin/bash
+      
+      # Define SMTP server settings
+      SMTP_SERVER="smtp-us.ser.proofpoint.com" #SMTP Server
+      SMTP_PORT=587
+
+      # Sender and recipient email addresses
+      FROM="noreply@gmail.com"
+      TO=${{ variables.to }}
+      if [[ -n "${{ variables.cc }}" ]]; then CC=${{ variables.to }}; fi
+      if [ -n "${{ variables.bcc }}" ]; then BCC=${{ variables.to }}; fi
+      # Email subject
+      SUBJECT="DevSecOps Templates"
+
+      # Inline email body text
+      INLINE_BODY="Please find the attached templates"
+
+      FILE=$(Build.SourcesDirectory)/file_list.txt
+
+      ##################################################
+      echo $(Build.RequestedForEmail)
+      echo "*******************************"
+      # Construct the initial part of the email message
+      EMAIL_MESSAGE=$(echo -e "From: $FROM\r\nTo: $TO\r\nCC: $CC\r\nBCC: $BCC\r\nSubject: $SUBJECT\r\nContent-Type: multipart/mixed; boundary=boundary123\r\n\r\n--boundary123")
+
+      # Iterate over each file in the directory and add them as attachments
+      while IFS= read -r ATTACHMENT_FILE ; do
+          if [ -f "$(Build.ArtifactStagingDirectory)/from_nexus/$ATTACHMENT_FILE" ] && [ "$(basename "$ATTACHMENT_FILE")" != "nexus_downloads.csv" ]; then
+                  echo "$ATTACHMENT_FILE"
+                  trimmed_file=$(echo "$ATTACHMENT_FILE" | sed 's|^\./||')
+                  FILE_NAME=$(echo "$trimmed_file" | sed 's/\//-/g')
+                  echo $FILE_NAME
+                  FILE_CONTENT=$(base64 "$(Build.ArtifactStagingDirectory)/from_nexus/$ATTACHMENT_FILE")
+                  ATTACHMENT_CONTENT_TYPE=$(file -b --mime-type "$(Build.ArtifactStagingDirectory)/from_nexus/$ATTACHMENT_FILE")
+                  EMAIL_MESSAGE+="\r\n--boundary123\r\nContent-Type: $ATTACHMENT_CONTENT_TYPE; name=\"$FILE_NAME\"\r\nContent-Disposition: attachment; filename=\"$FILE_NAME\"\r\nContent-Transfer-Encoding: base64\r\n\r\n$FILE_CONTENT"
+                  
+          fi
+      done < "$FILE"
+
+      # Add closing boundary to end the message
+      EMAIL_MESSAGE+="\r\n--boundary123--"
+      ##################################################
+      
+      # Send the email with attachment and inline body using curl command over SMTPS (SMTP with SSL/TLS)
+      curl --url "smtp://$SMTP_SERVER:$SMTP_PORT" --ssl-reqd \
+        --mail-from "$FROM" --mail-rcpt "$TO" --mail-rcpt "$CC" --mail-rcpt "$BCC" \
+        --user "$(SMTP-USERNAME):$(SMTP-PASSWORD)" \
+        --upload-file - <<<$(echo -e "$EMAIL_MESSAGE")
+      
+      echo "Email sent successfully."
+      #cp counter.csv $(Build.ArtifactStagingDirectory)
+    
+    displayName: 'Email Downloaded templates'
+ 
+  - script: |
+      #!/bin/bash
+      
+      current_date=$(date +'%Y-%m-%dT%H:%M:%S')
+      FILE=$(Build.SourcesDirectory)/file_list.txt
+      
+      # Iterate over each file in the directory and add them as attachments
+      while IFS= read -r NEXUS_FILE ; do
+          if [ -f "$(Build.ArtifactStagingDirectory)/from_nexus/$NEXUS_FILE" ] && [ "$(basename "$NEXUS_FILE")" != "nexus_downloads.csv" ]; then
+                  FILE_NAME=$(echo "$NEXUS_FILE" | sed 's|^\./||')
+                  dir=$(dirname "$FILE_NAME")
+                  base_name=$(basename "$NEXUS_FILE")
+                  echo "$NEXUS_FILE"
+                  echo $current_date,$dir,$base_name,$(Build.RequestedForEmail) >>$(Build.ArtifactStagingDirectory)/nexus_downloads.csv
+          fi
+      done < "$FILE"
+    displayName: 'Update Nexus Downloads file'
+
+  - task: AzureCLI@2
+    displayName: 'Upload Nexus Downloads file to storage account'
+    inputs:
+      azureSubscription: ${{ variables.azureSubscription }}
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        az storage blob upload \
+            --account-name ${{ variables.storage_account }} \
+            --container-name ${{ variables.container }} \
+            --name nexus_downloads.csv \
+            --file nexus_downloads.csv \
+            --auth-mode login \
+            --overwrite true
+      workingDirectory: '$(Build.ArtifactStagingDirectory)'
+  
+  - script: |
+      #!/bin/bash
+      
+      # Define SMTP server settings
+      SMTP_SERVER="smtp-us.ser.proofpoint.com"
+      SMTP_PORT=587
+
+      # Sender and recipient email addresses
+      FROM="noreply@cencora.com"
+      TO=${{ variables.to }}
+      # Email subject
+      SUBJECT="Nexus Download file"
+
+      # Inline email body text
+      INLINE_BODY="Please find the attached document with the name of the downloaded templated and by whom"
+
+      ATTACHMENT_FILE=$(Build.ArtifactStagingDirectory)/nexus_downloads.csv
+
+      ##################################################
+      echo $(Build.RequestedForEmail)
+      echo "*******************************"
+      # Construct the initial part of the email message
+      EMAIL_MESSAGE=$(echo -e "From: $FROM\r\nTo: $TO\r\nSubject: $SUBJECT\r\nContent-Type: multipart/mixed; boundary=boundary123\r\n\r\n--boundary123")
+
+      # Iterate over each file in the directory and add them as attachments
+      echo "$ATTACHMENT_FILE"
+      FILE_CONTENT=$(base64 "$ATTACHMENT_FILE")
+      FILE_NAME=$(basename "$ATTACHMENT_FILE")
+      EMAIL_MESSAGE+="\r\n--boundary123\r\nContent-Type: application/octet-stream; name=\"$FILE_NAME\"\r\nContent-Disposition: attachment; filename=\"$FILE_NAME\"\r\nContent-Transfer-Encoding: base64\r\n\r\n$FILE_CONTENT"
+      # Add closing boundary to end the message
+      EMAIL_MESSAGE+="\r\n--boundary123--"
+      ##################################################
+      
+      # Send the email with attachment and inline body using curl command over SMTPS (SMTP with SSL/TLS)
+      curl --url "smtp://$SMTP_SERVER:$SMTP_PORT" --ssl-reqd \
+        --mail-from "$FROM" --mail-rcpt "$TO" \
+        --user "$(SMTP-USERNAME):$(SMTP-PASSWORD)" \
+        --upload-file - <<<$(echo -e "$EMAIL_MESSAGE")
+      
+      echo "Email sent successfully."
+      #cp counter.csv $(Build.ArtifactStagingDirectory)
+    displayName: 'Email Nexus Downloads file'

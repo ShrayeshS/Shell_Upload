@@ -1,0 +1,12 @@
+variables:
+  base_url: https://upload_url
+  container:                # Destination Container Name for downloads.csv
+  storage_account:            # Destination Storage Account Name for downloads.csv
+  azureSubscription:   # Service Connection to the Azure Blob
+
+# Email for receiving the checksum files
+########################################################################################################################################
+  to: ""     # Mandatory
+  cc: ""                    # Optional
+  bcc: null    # Optional
+########################################################################################################################################

@@ -1,0 +1,22 @@
+variables:
+  base_url: https://**nexus_url**  #Base URL of the Nexus Repo
+  destinationRepo: https://<PAT>@dev.azure.com/<Repo>   #Destination Repo with the PAT where the files are to be uploaded. This PAT can be taken from a vault from additional security
+  reset: 0                                   # 1 indicates the nexus_downloads.csv is truncated essentially resetting it. 0 indicates no action needed on downloads.csv file
+  container:                # Destination Container Name for downloads.csv
+  storage_account:           # Destination Storage Account Name for downloads.csv
+  azureSubscription:    # Service Connection to the Azure Blob
+
+
+# Email to receive the templates
+########################################################################################################################################
+  to: null     # Mandatory
+  cc: null                                   # Optional
+  bcc: null    # Optional
+
+
+########################################################################################################################################
+## Mention the entire path of the file to be downloaded - Sample file names given below ##
+  files_to_download: 
+    file1
+    file2
+    Azure_Templates/Terraform/file3
